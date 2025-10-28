@@ -181,7 +181,7 @@ fn fetch_diff_files(
                 .next() // 获取 <a> 标签的文本内容
                 .map(|text| text.trim().to_string()) // 去除前后空白字符
         })
-        .filter(|file| !file.is_empty()) // 过滤掉空字符串
+        .filter(|file| !file.is_empty() && file != "current_version_commit_hash.txt") // 过滤掉空字符串
         .collect();
 
     if files.is_empty() {
