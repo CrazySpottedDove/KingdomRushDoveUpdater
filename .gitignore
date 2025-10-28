@@ -1,3 +1,8 @@
 /target
 *.lua
 _assets/
+makefiles/
+all/
+all-desktop/
+kr1/
+kr1-desktop/

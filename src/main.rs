@@ -12,6 +12,7 @@ const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
 use std::path::Path;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: 读取本地 commit-hash
     let local_commit_hash = read_local_commit_hash()?;
@@ -36,13 +37,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let diff_files = fetch_diff_files(&local_commit_hash, &remote_commit_hash)?;
     println!("{CYAN}需更新代码文件: {:?}{RESET}", diff_files);
 
-    // TODO: 下载差分文件并更新本地文件
-    diff_files
+    // 下载差分文件并更新本地文件
+    let results: Vec<_> = diff_files
         .par_iter()
         .map(|file| download_and_replace_file(file).map_err(|e| format!("{}: {}", file, e)))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
+
+    let errors: Vec<_> = results.into_iter().filter_map(|res| res.err()).collect();
 
     update_assets()?;
+
+    if !errors.is_empty() {
+        println!("{RED}部分文件下载失败，未更新本地版本记录：{RESET}");
+        for err in errors {
+            println!("{RED}  - {}{RESET}", err);
+        }
+        println!("{CYAN}请修复网络或稍后重试。按回车键退出...{RESET}");
+        let mut _wait = String::new();
+        std::io::stdin().read_line(&mut _wait).ok();
+        return Ok(());
+    }
+
     println!("{GREEN}全部更新完成！{RESET}");
 
     // 写回最新 commit_hash
@@ -109,6 +124,8 @@ fn fetch_diff_files(
         local_commit, remote_commit
     );
 
+    println!("{CYAN}Diff URL: {diff_url}{RESET}");
+
     let client = Client::new();
     let response = client
         .get(&diff_url)
@@ -173,14 +190,14 @@ fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     println!("{CYAN}检查资源文件...{RESET}");
-    // Step 1: 读取 `assets_index.lua`
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
     let assets_dir = "_assets";
     let trashed_dir = "_trashed_assets";
 
-    // Step 2: 检查本地资源文件
     let mut download_batches: HashMap<String, Vec<String>> = HashMap::new();
     for (path, info) in &assets_index {
         let fullpath = format!("{}/{}", assets_dir, path);
@@ -202,11 +219,12 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Step 3: 下载缺失或过期的资源
-    // let client = Client::new();
+    // 用于收集所有下载失败的文件
+    let failed_files = Arc::new(Mutex::new(Vec::new()));
+
     for (release, files) in download_batches {
         use regex::Regex;
-        // ...existing code...
+        let failed_files = Arc::clone(&failed_files);
 
         files.par_iter().for_each(|file| {
             let filename = Path::new(&file)
@@ -230,10 +248,9 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             );
             println!("{CYAN}下载: {}{RESET}", url);
 
-            // 每个线程独立创建 client，避免并发冲突
             use std::time::Duration;
             let client = Client::builder()
-                .timeout(Duration::from_secs(300)) // 5分钟
+                .timeout(Duration::from_secs(300))
                 .build()
                 .unwrap();
             match client.get(&url).send() {
@@ -245,22 +262,38 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if fs::write(&fullpath, &content).is_ok() {
                             println!("{GREEN}资源已下载: {}{RESET}", file);
+                        } else {
+                            eprintln!("{RED}写入失败: {}{RESET}", file);
+                            failed_files.lock().unwrap().push(file.clone());
                         }
                     }
-                    Err(e) => eprintln!("{RED}写入失败: {}: {:?}{RESET}", file, e),
+                    Err(e) => {
+                        eprintln!("{RED}写入失败: {}: {:?}{RESET}", file, e);
+                        failed_files.lock().unwrap().push(file.clone());
+                    }
                 },
-                Ok(response) => eprintln!(
-                    "{RED}下载失败: {} 状态码: {}{RESET}",
-                    file,
-                    response.status()
-                ),
-                Err(e) => eprintln!("{RED}请求失败: {}: {:?}{RESET}", file, e),
+                Ok(_) => {
+                    eprintln!("{RED}下载失败: {} url: {}{RESET}", file, url);
+                    failed_files.lock().unwrap().push(file.clone());
+                }
+                Err(e) => {
+                    eprintln!("{RED}请求失败: {}: {:?}{RESET}", file, e);
+                    failed_files.lock().unwrap().push(file.clone());
+                }
             }
         });
     }
 
-    // Step 4: 清理多余或不匹配的资源
     trash_unindexed_assets(&assets_index, &assets_dir, &trashed_dir)?;
+
+    let failed_files = Arc::try_unwrap(failed_files).unwrap().into_inner().unwrap();
+    if !failed_files.is_empty() {
+        eprintln!("{RED}以下资源文件下载失败，未完成全部资源更新：{RESET}");
+        for file in &failed_files {
+            eprintln!("{RED}  - {}{RESET}", file);
+        }
+        return Err("部分资源文件下载失败".into());
+    }
 
     println!("{GREEN}资源检查完成。{RESET}");
     Ok(())
@@ -332,3 +365,4 @@ fn trash_unindexed_assets(
     }
     Ok(())
 }
+
