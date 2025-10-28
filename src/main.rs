@@ -19,56 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // println!("{CYAN}本地版本: {local_commit_hash}{RESET}");
 
     // 异步拉取 Gitee 日志：在后台线程执行，不阻塞下载
-    use std::sync::mpsc;
     use std::time::Duration;
-
-    // // 改为用 String 表示错误，String 是 Send，可以跨线程传递
-    // let (log_tx, log_rx) = mpsc::channel::<Result<Vec<String>, String>>();
-
-    // {
-    //     let owner = "CrazySpottedDove".to_string();
-    //     let repo = "KingdomRushDove".to_string();
-    //     let local = local_commit_hash.clone();
-    //     // let remote = remote_commit_hash.clone();
-    //     let tx = log_tx.clone();
-    //     std::thread::spawn(move || {
-    //         // 将错误转换为 String 以便安全跨线程传输
-    //         let res = fetch_commit_logs_gitee(&owner, &repo, &local);
-    //         let _ = tx.send(res.map_err(|e| e.to_string()));
-    //     });
-    // }
-
-    // // 启动一个打印线程：当日志到达时负责打印（不会阻塞主流程）
-    // let printer_handle = std::thread::spawn(move || {
-    //     // 等待一小段时间，如果在短时间内可得结果则立即打印，否则在稍后继续等待，避免用户短暂停顿感
-    //     match log_rx.recv_timeout(Duration::from_secs(1)) {
-    //         Ok(Ok(logs)) => {
-    //             if !logs.is_empty() {
-    //                 println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
-    //                 for line in logs {
-    //                     println!("{YELLOW}{}{RESET}", line);
-    //                     // std::thread::sleep(Duration::from_millis(120)); // 逐条显示，给用户视觉反馈
-    //                 }
-    //             }
-    //         }
-    //         Ok(Err(_e)) => {
-    //             // 拉取失败：沉默处理（不影响更新主流程）
-    //         }
-    //         Err(mpsc::RecvTimeoutError::Timeout) => {
-    //             // 如果超时，继续阻塞等待较长时间（比如最多再等 10s），或者直接在下载过程中以非阻塞方式再尝试 recv
-    //             if let Ok(Ok(logs)) = log_rx.recv_timeout(Duration::from_secs(10)) {
-    //                 if !logs.is_empty() {
-    //                     println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
-    //                     for line in logs {
-    //                         println!("{YELLOW}{}{RESET}", line);
-    //                         // std::thread::sleep(Duration::from_millis(120));
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //         Err(_) => {}
-    //     }
-    // });
 
     let owner = "CrazySpottedDove".to_string();
     let repo = "KingdomRushDove".to_string();
@@ -108,11 +59,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{YELLOW}检测到新版本，准备更新...{RESET}");
+    println!("{GREEN}检测到新版本，准备更新...{RESET}");
 
     // Step 4: 获取差分文件列表
     let diff_files = fetch_diff_files(&local_commit_hash, &remote_commit_hash)?;
     println!("{CYAN}需更新代码文件: {:?}{RESET}", diff_files);
+    for diff_file in &diff_files {
+        println!("{YELLOW}   {diff_file}{RESET}");
+    }
     println!("{CYAN}正在下载新文件...{RESET}");
 
     // 下载差分文件并更新本地文件
@@ -204,7 +158,7 @@ fn fetch_diff_files(
         local_commit, remote_commit
     );
 
-    println!("{CYAN}Diff URL: {diff_url}{RESET}");
+    // println!("{CYAN}Diff URL: {diff_url}{RESET}");
 
     let client = Client::new();
     let response = client
@@ -279,6 +233,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     let trashed_dir = "_trashed_assets";
 
     let mut download_batches: HashMap<String, Vec<String>> = HashMap::new();
+    let mut assets_count = 0;
     for (path, info) in &assets_index {
         let fullpath = format!("{}/{}", assets_dir, path);
         let local_size = file_size(&fullpath);
@@ -296,8 +251,14 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                 .entry(release)
                 .or_insert_with(Vec::new)
                 .push(path.clone());
+            assets_count += 1;
         }
     }
+
+    println!(
+        "{CYAN}需要下载或更新的美术资源数量: {} 个{RESET}",
+        assets_count
+    );
 
     // 用于收集所有下载失败的文件
     let failed_files = Arc::new(Mutex::new(Vec::new()));
@@ -320,7 +281,13 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                 format!(".{}.", &caps[1])
             });
             let re_dot = Regex::new(r"\.+").unwrap();
-            let url_filename = re_dot.replace_all(&replaced, ".");
+            let replaced = re_dot.replace_all(&replaced, ".");
+            // 新增：将单引号替换为点
+            let replaced = replaced.replace("'", ".");
+
+            // 新增：将空格替换为下划线
+            let url_filename = replaced.replace(" ", "_");
+            // let url_filename = re_dot.replace_all(&replaced, ".");
 
             let url = format!(
                 "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/releases/download/{}/{}",
