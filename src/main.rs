@@ -63,7 +63,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 4: 获取差分文件列表
     let diff_files = fetch_diff_files(&local_commit_hash, &remote_commit_hash)?;
-    println!("{CYAN}需更新代码文件: {:?}{RESET}", diff_files);
     for diff_file in &diff_files {
         println!("{YELLOW}   {diff_file}{RESET}");
     }
