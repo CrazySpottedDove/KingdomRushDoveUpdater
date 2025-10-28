@@ -16,11 +16,88 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: 读取本地 commit-hash
     let local_commit_hash = read_local_commit_hash()?;
-    println!("{CYAN}本地版本: {local_commit_hash}{RESET}");
+    // println!("{CYAN}本地版本: {local_commit_hash}{RESET}");
+
+    // 异步拉取 Gitee 日志：在后台线程执行，不阻塞下载
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // // 改为用 String 表示错误，String 是 Send，可以跨线程传递
+    // let (log_tx, log_rx) = mpsc::channel::<Result<Vec<String>, String>>();
+
+    // {
+    //     let owner = "CrazySpottedDove".to_string();
+    //     let repo = "KingdomRushDove".to_string();
+    //     let local = local_commit_hash.clone();
+    //     // let remote = remote_commit_hash.clone();
+    //     let tx = log_tx.clone();
+    //     std::thread::spawn(move || {
+    //         // 将错误转换为 String 以便安全跨线程传输
+    //         let res = fetch_commit_logs_gitee(&owner, &repo, &local);
+    //         let _ = tx.send(res.map_err(|e| e.to_string()));
+    //     });
+    // }
+
+    // // 启动一个打印线程：当日志到达时负责打印（不会阻塞主流程）
+    // let printer_handle = std::thread::spawn(move || {
+    //     // 等待一小段时间，如果在短时间内可得结果则立即打印，否则在稍后继续等待，避免用户短暂停顿感
+    //     match log_rx.recv_timeout(Duration::from_secs(1)) {
+    //         Ok(Ok(logs)) => {
+    //             if !logs.is_empty() {
+    //                 println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
+    //                 for line in logs {
+    //                     println!("{YELLOW}{}{RESET}", line);
+    //                     // std::thread::sleep(Duration::from_millis(120)); // 逐条显示，给用户视觉反馈
+    //                 }
+    //             }
+    //         }
+    //         Ok(Err(_e)) => {
+    //             // 拉取失败：沉默处理（不影响更新主流程）
+    //         }
+    //         Err(mpsc::RecvTimeoutError::Timeout) => {
+    //             // 如果超时，继续阻塞等待较长时间（比如最多再等 10s），或者直接在下载过程中以非阻塞方式再尝试 recv
+    //             if let Ok(Ok(logs)) = log_rx.recv_timeout(Duration::from_secs(10)) {
+    //                 if !logs.is_empty() {
+    //                     println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
+    //                     for line in logs {
+    //                         println!("{YELLOW}{}{RESET}", line);
+    //                         // std::thread::sleep(Duration::from_millis(120));
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         Err(_) => {}
+    //     }
+    // });
+
+    let owner = "CrazySpottedDove".to_string();
+    let repo = "KingdomRushDove".to_string();
+    let local = local_commit_hash.clone();
+    // let remote = remote_commit_hash.clone();
+
+    // 启动一个线程同时获取和打印日志
+    let handle = std::thread::spawn(move || {
+        match fetch_commit_logs_gitee(&owner, &repo, &local) {
+            Ok(logs) => {
+                if !logs.is_empty() {
+                    println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
+                    for line in logs {
+                        println!("{YELLOW}{}{RESET}", line);
+                        // 逐条显示，给用户视觉反馈
+                        std::thread::sleep(Duration::from_millis(120));
+                    }
+                }
+            }
+            Err(e) => {
+                // 拉取失败：打印错误信息（可选）
+                eprintln!("{RED}拉取更新日志失败：{}{RESET}", e);
+            }
+        }
+    });
 
     // Step 2: 获取远程仓库的最新 commit-hash
     let remote_commit_hash = fetch_remote_commit_hash()?;
-    println!("{CYAN}最新版本: {remote_commit_hash}{RESET}");
+    // println!("{CYAN}最新版本: {remote_commit_hash}{RESET}");
 
     // Step 3: 比较 commit-hash
     if local_commit_hash == remote_commit_hash {
@@ -36,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 4: 获取差分文件列表
     let diff_files = fetch_diff_files(&local_commit_hash, &remote_commit_hash)?;
     println!("{CYAN}需更新代码文件: {:?}{RESET}", diff_files);
+    println!("{CYAN}正在下载新文件...{RESET}");
 
     // 下载差分文件并更新本地文件
     let results: Vec<_> = diff_files
@@ -59,6 +137,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("{GREEN}全部更新完成！{RESET}");
+
+    let _ = handle.join();
 
     // 写回最新 commit_hash
     fs::write(LOCAL_COMMIT_FILE, &remote_commit_hash)?;
@@ -185,7 +265,7 @@ fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error
     }
 
     fs::write(path, &content)?;
-    println!("{GREEN}已更新: {}{RESET}", file);
+    // println!("{GREEN}已更新: {}{RESET}", file);
 
     Ok(())
 }
@@ -193,7 +273,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
-    println!("{CYAN}检查资源文件...{RESET}");
+    // println!("{CYAN}检查资源文件...{RESET}");
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
     let assets_dir = "_assets";
     let trashed_dir = "_trashed_assets";
@@ -207,10 +287,10 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|n| n.to_str())
             .unwrap_or(&path);
         if local_size != *info {
-            println!(
-                "{YELLOW}资源缺失或过期: {} (本地: {}, 需: {}){RESET}",
-                path, local_size, info
-            );
+            // println!(
+            //     "{YELLOW}资源缺失或过期: {} (本地: {}, 需: {}){RESET}",
+            //     path, local_size, info
+            // );
             let release = get_release_for_file(filename);
             download_batches
                 .entry(release)
@@ -246,7 +326,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                 "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/releases/download/{}/{}",
                 release, url_filename
             );
-            println!("{CYAN}下载: {}{RESET}", url);
+            // println!("{CYAN}下载: {}{RESET}", url);
 
             use std::time::Duration;
             let client = Client::builder()
@@ -261,7 +341,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = fs::create_dir_all(parent);
                         }
                         if fs::write(&fullpath, &content).is_ok() {
-                            println!("{GREEN}资源已下载: {}{RESET}", file);
+                            // println!("{GREEN}资源已下载: {}{RESET}", file);
                         } else {
                             eprintln!("{RED}写入失败: {}{RESET}", file);
                             failed_files.lock().unwrap().push(file.clone());
@@ -295,7 +375,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
         return Err("部分资源文件下载失败".into());
     }
 
-    println!("{GREEN}资源检查完成。{RESET}");
+    // println!("{GREEN}资源检查完成。{RESET}");
     Ok(())
 }
 
@@ -366,3 +446,117 @@ fn trash_unindexed_assets(
     Ok(())
 }
 
+/// 从 Gitee 分页获取 commits，直到遇到 local_commit 为止，返回从 local 之后到 remote 的 commit message 列表（旧->新）
+fn fetch_commit_logs_gitee(
+    owner: &str,
+    repo: &str,
+    local_commit: &str,
+    // remote_commit: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let mut page = 1;
+    let per_page = 100usize;
+    let mut collected: Vec<(String, String)> = Vec::new(); // (oid, message)
+
+    loop {
+        let url = format!(
+            "https://gitee.com/api/v5/repos/{owner}/{repo}/commits?page={page}&per_page={per_page}",
+            owner = owner,
+            repo = repo,
+            page = page,
+            per_page = per_page
+        );
+
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0")
+            .send()?;
+
+        if !resp.status().is_success() {
+            break;
+        }
+        let text = resp.text()?;
+        let arr: Value = serde_json::from_str(&text)?;
+        let commits = arr
+            .as_array()
+            .ok_or("Gitee commits response is not array")?;
+        if commits.is_empty() {
+            break;
+        }
+
+        for c in commits {
+            // Gitee 的 commit 对象通常有 "id" 与 "message"
+            let oid = c
+                .get("id")
+                .and_then(|v| v.as_str())
+                .or_else(|| c.get("sha").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let msg = c
+                .get("commit")
+                .and_then(|commit| commit.get("message"))
+                .or_else(|| c.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            collected.push((oid.clone(), msg));
+
+            // 一旦遇到 local_commit，停止拉取（因为返回按时间倒序）
+            if oid == local_commit {
+                break;
+            }
+        }
+
+        // 如果最后一页包含 local_commit，则停止分页
+        if collected.iter().any(|(oid, _)| oid == local_commit) {
+            break;
+        }
+        page += 1;
+        // 安全保护：防止无限循环
+        if page > 50 {
+            break;
+        }
+    }
+
+    if collected.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // collected 目前是从新到旧（Gitee 默认），我们需要从 local 之后到 remote 的顺序（旧->新）
+    // 找到 local_commit 在列表中的位置（可能不存在）
+    let mut result: Vec<String> = Vec::new();
+    // 收集直到但不包含 local_commit；同时只保留到 remote_commit 为止（remote 应位于最前面）
+    for (oid, _) in &collected {
+        if oid == local_commit {
+            break;
+        }
+    }
+    // collected 是 newest -> older，截取从 remote（包含）到 local（不包含）
+    // 我们找到索引
+    let idx_local = collected.iter().position(|(oid, _)| oid == local_commit);
+    // let idx_remote = collected.iter().position(|(oid, _)| oid == remote_commit);
+
+    // let start = idx_remote.unwrap_or(0); // remote 在较前位置（可能 0）
+    let start = 0;
+    let end = idx_local.unwrap_or(collected.len()); // 不包含 local
+
+    // slice start..end (newest->older), 需要 reverse 成旧->新并格式化
+    if start < end {
+        let slice = &collected[start..end];
+        let mut rev: Vec<(String, String)> = slice.iter().cloned().collect();
+        rev.reverse();
+        for (oid, msg) in rev {
+            let short = if oid.len() >= 8 { &oid[..8] } else { &oid[..] };
+            if msg.is_empty() {
+                result.push(format!("- ({})", short));
+            } else {
+                // 只取第一行作为摘要
+                let first_line = msg.lines().next().unwrap_or("").trim();
+                result.push(format!("- {} ({})", first_line, short));
+            }
+        }
+    }
+
+    Ok(result)
+}
