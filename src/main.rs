@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Step 2: 获取远程仓库的最新 commit-hash
+    println!("{CYAN}正在检查最新版本...{RESET}");
     let remote_commit_hash = fetch_remote_commit_hash()?;
     // println!("{CYAN}最新版本: {remote_commit_hash}{RESET}");
 
@@ -82,8 +83,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let errors: Vec<_> = results.into_iter().filter_map(|res| res.err()).collect();
 
-    update_assets()?;
-
     if !errors.is_empty() {
         println!("{RED}部分文件下载失败，未更新本地版本记录：{RESET}");
         for err in errors {
@@ -95,9 +94,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{GREEN}全部更新完成！{RESET}");
-
     let _ = handle.join();
+
+    update_assets()?;
+
+    println!("{GREEN}全部更新完成！{RESET}");
 
     // 写回最新 commit_hash
     fs::write(LOCAL_COMMIT_FILE, &remote_commit_hash)?;
@@ -243,11 +244,12 @@ fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error
 
     Ok(())
 }
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use indicatif::{ProgressBar, ProgressStyle};
 
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
-    // println!("{CYAN}检查资源文件...{RESET}");
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
     let assets_dir = "_assets";
     let trashed_dir = "_trashed_assets";
@@ -262,10 +264,6 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|n| n.to_str())
             .unwrap_or(&path);
         if local_size != *info {
-            // println!(
-            //     "{YELLOW}资源缺失或过期: {} (本地: {}, 需: {}){RESET}",
-            //     path, local_size, info
-            // );
             let release = get_release_for_file(filename);
             download_batches
                 .entry(release)
@@ -280,13 +278,21 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
         assets_count
     );
 
+    let pb = ProgressBar::new(assets_count);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})").unwrap()
+            .progress_chars("==-"),
+    );
+
     // 用于收集所有下载失败的文件
     let failed_files = Arc::new(Mutex::new(Vec::new()));
+    let pb = Arc::new(pb);
 
     for (release, files) in download_batches {
         use regex::Regex;
         let failed_files = Arc::clone(&failed_files);
-
+        let pb = Arc::clone(&pb);
         files.par_iter().for_each(|file| {
             let filename = Path::new(&file)
                 .file_name()
@@ -300,13 +306,14 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             let replaced = re_round.replace_all(&replaced, |caps: &regex::Captures| {
                 format!(".{}.", &caps[1])
             });
-            let re_dot = Regex::new(r"\.+").unwrap();
-            let replaced = re_dot.replace_all(&replaced, ".");
-            // 新增：将单引号替换为点
+                        // 新增：将单引号替换为点
             let replaced = replaced.replace("'", ".");
 
             // 新增：将空格替换为下划线
-            let url_filename = replaced.replace(" ", "_");
+            let replaced = replaced.replace(" ", ".");
+            let re_dot = Regex::new(r"\.+").unwrap();
+            let url_filename = re_dot.replace_all(&replaced, ".");
+
             // let url_filename = re_dot.replace_all(&replaced, ".");
 
             let url = format!(
@@ -317,7 +324,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
 
             use std::time::Duration;
             let client = Client::builder()
-                .timeout(Duration::from_secs(300))
+                .timeout(Duration::from_secs(400))
                 .build()
                 .unwrap();
             match client.get(&url).send() {
@@ -329,18 +336,19 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if fs::write(&fullpath, &content).is_ok() {
                             // println!("{GREEN}资源已下载: {}{RESET}", file);
+                            pb.inc(1);
                         } else {
                             eprintln!("{RED}写入失败: {}{RESET}", file);
                             failed_files.lock().unwrap().push(file.clone());
                         }
                     }
                     Err(e) => {
-                        eprintln!("{RED}写入失败: {}: {:?}{RESET}", file, e);
+                        eprintln!("{RED}字节转换失败: {}: {:?}{RESET}", file, e);
                         failed_files.lock().unwrap().push(file.clone());
                     }
                 },
                 Ok(_) => {
-                    eprintln!("{RED}下载失败: {} url: {}{RESET}", file, url);
+                    eprintln!("{RED}请求状态异常: {} url: {}{RESET}", file, url);
                     failed_files.lock().unwrap().push(file.clone());
                 }
                 Err(e) => {
@@ -350,6 +358,8 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    pb.finish_with_message("资源下载结束");
 
     trash_unindexed_assets(&assets_index, &assets_dir, &trashed_dir)?;
 

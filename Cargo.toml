@@ -13,6 +13,7 @@ rayon = "1.5"
 regex = "1.5"
 time = "0.2"
 windows-sys = { version = "0.52", features = ["Win32_System_LibraryLoader"] }
+indicatif = "0.18.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.10.1"
