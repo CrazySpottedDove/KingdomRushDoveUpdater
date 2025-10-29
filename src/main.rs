@@ -11,15 +11,25 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
+const WORK_DIR: &str = "Kingdom Rush";
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(debug_assertions) {
+        if !is_current_dir_safe() {
+            println!(
+                "{RED}你在错误的目录运行了更新程序！请将更新程序放置在 {WORK_DIR} 目录后再运行。{RESET}"
+            );
+            wait_for_enter();
+            return Ok(());
+        }
+    }
+
     // Step 1: 读取本地 commit-hash
     let local_commit_hash = read_local_commit_hash()?;
     // println!("{CYAN}本地版本: {local_commit_hash}{RESET}");
 
     // 异步拉取 Gitee 日志：在后台线程执行，不阻塞下载
-    use std::time::Duration;
 
     let owner = "CrazySpottedDove".to_string();
     let repo = "KingdomRushDove".to_string();
@@ -34,8 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
                     for line in logs {
                         println!("{YELLOW}{}{RESET}", line);
-                        // 逐条显示，给用户视觉反馈
-                        std::thread::sleep(Duration::from_millis(120));
                     }
                 }
             }
@@ -53,9 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: 比较 commit-hash
     if local_commit_hash == remote_commit_hash {
         println!("{GREEN}已是最新，无需更新。{RESET}");
-        println!("{CYAN}按回车键退出...{RESET}");
-        let mut _wait = String::new();
-        std::io::stdin().read_line(&mut _wait).ok();
+        wait_for_enter();
         return Ok(());
     }
 
@@ -83,9 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for err in errors {
             println!("{RED}  - {}{RESET}", err);
         }
-        println!("{CYAN}请修复网络或稍后重试。按回车键退出...{RESET}");
-        let mut _wait = String::new();
-        std::io::stdin().read_line(&mut _wait).ok();
+        println!("{CYAN}请修复网络或稍后重试。{RESET}");
+
+        wait_for_enter();
         return Ok(());
     }
 
@@ -96,12 +102,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 写回最新 commit_hash
     fs::write(LOCAL_COMMIT_FILE, &remote_commit_hash)?;
     println!("{GREEN}已更新本地版本记录。{RESET}");
+    wait_for_enter();
+    Ok(())
+}
 
+fn is_current_dir_safe() -> bool {
+    let current_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    if let Some(dir_name) = current_dir.file_name() {
+        if dir_name == WORK_DIR {
+            return true;
+        }
+    }
+    false
+}
+
+fn wait_for_enter() {
     println!("{CYAN}按回车键退出...{RESET}");
     let mut _wait = String::new();
     std::io::stdin().read_line(&mut _wait).ok();
-
-    Ok(())
 }
 
 fn read_local_commit_hash() -> io::Result<String> {
