@@ -134,7 +134,9 @@ fn read_local_commit_hash() -> io::Result<String> {
 }
 
 fn fetch_remote_commit_hash() -> Result<String, Box<dyn std::error::Error>> {
-    let client = Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
     let response = client
         .get(REPO_MASTER_COMMIT_HASH_API)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0")
@@ -181,7 +183,9 @@ fn fetch_diff_files(
 
     // println!("{CYAN}Diff URL: {diff_url}{RESET}");
 
-    let client = Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
     let response = client
         .get(&diff_url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0")
@@ -215,7 +219,9 @@ fn fetch_diff_files(
 
 fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error>> {
     let url = format!("{}{}", BASE_DOWNLOAD_URL, file);
-    let client = Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
     let response = client.get(&url).send()?;
 
     if !response.status().is_success() {
@@ -245,9 +251,9 @@ fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use indicatif::{ProgressBar, ProgressStyle};
 
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
@@ -281,7 +287,10 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     let pb = ProgressBar::new(assets_count);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})").unwrap()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
             .progress_chars("==-"),
     );
 
@@ -306,7 +315,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             let replaced = re_round.replace_all(&replaced, |caps: &regex::Captures| {
                 format!(".{}.", &caps[1])
             });
-                        // 新增：将单引号替换为点
+            // 新增：将单引号替换为点
             let replaced = replaced.replace("'", ".");
 
             // 新增：将空格替换为下划线
@@ -324,6 +333,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
 
             use std::time::Duration;
             let client = Client::builder()
+                .danger_accept_invalid_certs(true)
                 .timeout(Duration::from_secs(400))
                 .build()
                 .unwrap();
@@ -450,7 +460,9 @@ fn fetch_commit_logs_gitee(
     local_commit: &str,
     // remote_commit: &str,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let client = Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
     let mut page = 1;
     let per_page = 100usize;
     let mut collected: Vec<(String, String)> = Vec::new(); // (oid, message)
