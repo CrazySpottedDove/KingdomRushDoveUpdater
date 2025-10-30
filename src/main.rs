@@ -251,16 +251,19 @@ fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
+const PROXY_LIST: [&str; 2] = ["https://dgithub.xyz", "https://bgithub.xyz"];
+const MAX_RETRY: u64 = 3;
 
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
     let assets_dir = "_assets";
     let trashed_dir = "_trashed_assets";
 
-    let mut download_batches: HashMap<String, Vec<String>> = HashMap::new();
+    let mut download_batches: HashMap<String, Vec<(String, u64)>> = HashMap::new();
     let mut assets_count = 0;
     for (path, info) in &assets_index {
         let fullpath = format!("{}/{}", assets_dir, path);
@@ -274,7 +277,7 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
             download_batches
                 .entry(release)
                 .or_insert_with(Vec::new)
-                .push(path.clone());
+                .push((path.clone(), *info));
             assets_count += 1;
         }
     }
@@ -284,92 +287,121 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
         assets_count
     );
 
-    let pb = ProgressBar::new(assets_count);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
-            )
-            .unwrap()
-            .progress_chars("==-"),
-    );
-
-    // 用于收集所有下载失败的文件
+    let m = Arc::new(MultiProgress::new());
     let failed_files = Arc::new(Mutex::new(Vec::new()));
-    let pb = Arc::new(pb);
+
+    let mut handles = vec![];
 
     for (release, files) in download_batches {
-        use regex::Regex;
+        let m = Arc::clone(&m);
         let failed_files = Arc::clone(&failed_files);
-        let pb = Arc::clone(&pb);
-        files.par_iter().for_each(|file| {
-            let filename = Path::new(&file)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&file);
+        let assets_dir = assets_dir.to_string();
 
-            let re_square = Regex::new(r"\[([^\]]+)\]").unwrap();
-            let replaced =
-                re_square.replace_all(filename, |caps: &regex::Captures| format!(".{}.", &caps[1]));
-            let re_round = Regex::new(r"\(([^)]+)\)").unwrap();
-            let replaced = re_round.replace_all(&replaced, |caps: &regex::Captures| {
-                format!(".{}.", &caps[1])
+        let handle = std::thread::spawn(move || {
+            use regex::Regex;
+            files.par_iter().for_each(|(file, file_size)| {
+                let filename = Path::new(&file)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&file);
+
+                let re_square = Regex::new(r"\[([^\]]+)\]").unwrap();
+                let replaced = re_square
+                    .replace_all(filename, |caps: &regex::Captures| format!(".{}.", &caps[1]));
+                let re_round = Regex::new(r"\(([^)]+)\)").unwrap();
+                let replaced = re_round.replace_all(&replaced, |caps: &regex::Captures| {
+                    format!(".{}.", &caps[1])
+                });
+                let replaced = replaced.replace("'", ".");
+                let replaced = replaced.replace(" ", ".");
+                let re_dot = Regex::new(r"\.+").unwrap();
+                let url_filename = re_dot.replace_all(&replaced, ".");
+
+                use std::time::Duration;
+
+                let pb = m.add(
+                ProgressBar::new(*file_size)
+                    .with_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {percent}%")
+                            .unwrap()
+                            .progress_chars("==-"),
+                    )
+                );
+                pb.set_message(format!("下载中: {}", file));
+                for retry in 0..MAX_RETRY{
+                    let proxy = PROXY_LIST[(retry as usize) % PROXY_LIST.len()];
+                    let url = format!("{proxy}/CrazySpottedDove/KingdomRushDove/releases/download/{release}/{url_filename}");
+                                    let client = Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .timeout(Duration::from_secs(60))
+                    .build()
+                    .unwrap();
+                    match client.get(&url).send() {
+                        Ok(mut response) if response.status().is_success() => {
+                            let fullpath = format!("{}/{}", assets_dir, file);
+                            if let Some(parent) = Path::new(&fullpath).parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            let mut file_out = match fs::File::create(&fullpath) {
+                                Ok(f) => f,
+                                Err(e) => {
+                                    pb.finish_with_message(format!("写入失败: {}: {:?}", file, e));
+                                    failed_files.lock().unwrap().push(file.clone());
+                                    return;
+                                }
+                            };
+                            let mut downloaded: u64 = 0;
+                            let mut buf = [0u8; 16 * 1024];
+                            loop {
+                                match response.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        if file_out.write_all(&buf[..n]).is_err() {
+                                            pb.finish_with_message(format!("写入失败: {}", file));
+                                            failed_files.lock().unwrap().push(file.clone());
+                                            return;
+                                        }
+                                        downloaded += n as u64;
+                                        pb.set_position(downloaded);
+                                    }
+                                    Err(e) => {
+                                        pb.finish_with_message(format!("下载失败: {}: {:?}", file, e));
+                                        if retry == MAX_RETRY - 1 {
+                                            failed_files.lock().unwrap().push(file.clone());
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            pb.finish_with_message(format!("已完成: {}", file));
+                            return;
+                        }
+                        Ok(_) => {
+                            pb.finish_with_message(format!("请求状态异常: {}", file));
+                            if retry == MAX_RETRY - 1 {
+                                failed_files.lock().unwrap().push(file.clone());
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            pb.finish_with_message(format!("请求失败: {}: {:?}", file, e));
+                            if retry == MAX_RETRY - 1 {
+                                failed_files.lock().unwrap().push(file.clone());
+                            }
+                            continue;
+                        }
+                    }
+                }
             });
-            // 新增：将单引号替换为点
-            let replaced = replaced.replace("'", ".");
-
-            // 新增：将空格替换为下划线
-            let replaced = replaced.replace(" ", ".");
-            let re_dot = Regex::new(r"\.+").unwrap();
-            let url_filename = re_dot.replace_all(&replaced, ".");
-
-            // let url_filename = re_dot.replace_all(&replaced, ".");
-
-            let url = format!(
-                "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/releases/download/{}/{}",
-                release, url_filename
-            );
-            // println!("{CYAN}下载: {}{RESET}", url);
-
-            use std::time::Duration;
-            let client = Client::builder()
-                .danger_accept_invalid_certs(true)
-                .timeout(Duration::from_secs(400))
-                .build()
-                .unwrap();
-            match client.get(&url).send() {
-                Ok(response) if response.status().is_success() => match response.bytes() {
-                    Ok(content) => {
-                        let fullpath = format!("{}/{}", assets_dir, file);
-                        if let Some(parent) = Path::new(&fullpath).parent() {
-                            let _ = fs::create_dir_all(parent);
-                        }
-                        if fs::write(&fullpath, &content).is_ok() {
-                            // println!("{GREEN}资源已下载: {}{RESET}", file);
-                            pb.inc(1);
-                        } else {
-                            eprintln!("{RED}写入失败: {}{RESET}", file);
-                            failed_files.lock().unwrap().push(file.clone());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("{RED}字节转换失败: {}: {:?}{RESET}", file, e);
-                        failed_files.lock().unwrap().push(file.clone());
-                    }
-                },
-                Ok(_) => {
-                    eprintln!("{RED}请求状态异常: {} url: {}{RESET}", file, url);
-                    failed_files.lock().unwrap().push(file.clone());
-                }
-                Err(e) => {
-                    eprintln!("{RED}请求失败: {}: {:?}{RESET}", file, e);
-                    failed_files.lock().unwrap().push(file.clone());
-                }
-            }
         });
+        handles.push(handle);
     }
 
-    pb.finish_with_message("资源下载结束");
+    for handle in handles {
+        let _ = handle.join();
+    }
+    m.clear().unwrap();
 
     trash_unindexed_assets(&assets_index, &assets_dir, &trashed_dir)?;
 
@@ -382,10 +414,8 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
         return Err("部分资源文件下载失败".into());
     }
 
-    // println!("{GREEN}资源检查完成。{RESET}");
     Ok(())
 }
-
 use mlua::Lua;
 
 fn read_assets_index(path: &str) -> Result<HashMap<String, u64>, Box<dyn std::error::Error>> {
