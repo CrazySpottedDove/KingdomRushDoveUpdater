@@ -62,7 +62,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: 比较 commit-hash
     if local_commit_hash == remote_commit_hash {
         println!("{GREEN}已是最新，无需更新。{RESET}");
-        wait_for_enter();
+        println!("{YELLOW}如果想强行检查美术资源，请输入c并回车{RESET}");
+        println!("{YELLOW}否则，按回车退出{RESET}");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        if input.trim().eq_ignore_ascii_case("c") {
+            if let Err(e) = update_assets() {
+                eprintln!("{RED}资源检查/更新失败：{}{RESET}", e);
+            } else {
+                println!("{GREEN}美术资源检查/更新完成！{RESET}");
+            }
+            wait_for_enter();
+        }
         return Ok(());
     }
 
@@ -255,8 +267,14 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-const PROXY_LIST: [&str; 2] = ["https://dgithub.xyz", "https://bgithub.xyz"];
+const PROXY_LIST: [&str; 3] = [
+    "https://hub.gitmirror.com/https://github.com",
+    "https://dgithub.xyz",
+    "https://bgithub.xyz",
+];
 const MAX_RETRY: u64 = 3;
+const SPEED_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const MIN_SPEED: u64 = 10 * 1024; // 10KB/s
 
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
@@ -320,24 +338,38 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                 use std::time::Duration;
 
                 let pb = m.add(
-                ProgressBar::new(*file_size)
-                    .with_style(
-                        ProgressStyle::default_bar()
-                            .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {percent}%")
-                            .unwrap()
-                            .progress_chars("==-"),
-                    )
+                    ProgressBar::new(*file_size)
+                        .with_style(
+                            ProgressStyle::default_bar()
+                                .template("{spinner:.green} {msg} [{bar:40.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} {percent}%")
+                                .unwrap()
+                                .progress_chars("==-"),
+                        )
                 );
-                pb.set_message(format!("下载中: {}", file));
-                for retry in 0..MAX_RETRY{
+                pb.set_message(format!("下载中: {}", filename));
+                let mut success = false;
+                for retry in 0..MAX_RETRY {
                     let proxy = PROXY_LIST[(retry as usize) % PROXY_LIST.len()];
+
+                    if retry > 0 {
+                        pb.reset();
+                        pb.set_position(0);
+                        pb.set_message(format!("使用镜像{}重试中({}/{}) {}",proxy, retry + 1, MAX_RETRY, filename));
+                    }
                     let url = format!("{proxy}/CrazySpottedDove/KingdomRushDove/releases/download/{release}/{url_filename}");
-                                    let client = Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .timeout(Duration::from_secs(60))
-                    .build()
-                    .unwrap();
-                    match client.get(&url).send() {
+                    let client = Client::builder()
+                        .danger_accept_invalid_certs(true)
+                        .timeout(Duration::from_secs(60))
+                        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0")
+                        .build()
+                        .unwrap();
+                    match client.get(&url).header("Accept", "*/*")
+                                .header("Accept-Language", "zh-CN,zh;q=0.9")
+                                .header("Connection", "keep-alive")
+                                .header("Sec-Fetch-Mode", "no-cors")
+                                .header("Sec-Fetch-Site", "none")
+                                .header("Sec-Fetch-User", "?1")
+                                .header("Upgrade-Insecure-Requests", "1").send() {
                         Ok(mut response) if response.status().is_success() => {
                             let fullpath = format!("{}/{}", assets_dir, file);
                             if let Some(parent) = Path::new(&fullpath).parent() {
@@ -353,6 +385,9 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                             };
                             let mut downloaded: u64 = 0;
                             let mut buf = [0u8; 16 * 1024];
+                            let mut last_check = std::time::Instant::now();
+                            let mut last_downloaded = 0u64;
+                            let mut slow_count = 0;
                             loop {
                                 match response.read(&mut buf) {
                                     Ok(0) => break,
@@ -364,34 +399,52 @@ fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         downloaded += n as u64;
                                         pb.set_position(downloaded);
+                                        let now = std::time::Instant::now();
+                                        if now.duration_since(last_check) >= SPEED_CHECK_INTERVAL {
+                                            let bytes = downloaded - last_downloaded;
+                                            let speed = bytes as u64 / SPEED_CHECK_INTERVAL.as_secs();
+                                            if speed < MIN_SPEED {
+                                                slow_count += 1;
+                                            } else {
+                                                slow_count = 0;
+                                            }
+                                            last_check = now;
+                                            last_downloaded = downloaded;
+                                            if slow_count >= 2 {
+                                                pb.set_message(format!("速度过慢，切换镜像..."));
+                                                break; // 主动中断，进入下一个重试
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         pb.finish_with_message(format!("下载失败: {}: {:?}", file, e));
-                                        if retry == MAX_RETRY - 1 {
-                                            failed_files.lock().unwrap().push(file.clone());
-                                        }
-                                        continue;
+                                        break;
                                     }
                                 }
                             }
                             pb.finish_with_message(format!("已完成: {}", file));
-                            return;
+                            success = true;
+                            break;
                         }
-                        Ok(_) => {
-                            pb.finish_with_message(format!("请求状态异常: {}", file));
-                            if retry == MAX_RETRY - 1 {
-                                failed_files.lock().unwrap().push(file.clone());
-                            }
+                        Ok(r) => {
+                            println!(
+                                "{RED}下载失败: {} 状态码: {}{RESET}",
+                                file,
+                                r.status()
+                            );
+                            // 状态异常，重试
                             continue;
                         }
                         Err(e) => {
-                            pb.finish_with_message(format!("请求失败: {}: {:?}", file, e));
-                            if retry == MAX_RETRY - 1 {
-                                failed_files.lock().unwrap().push(file.clone());
-                            }
+                            // 请求失败，重试
+                            println!("{RED}请求失败: {} 错误: {:?}{RESET}", file, e);
                             continue;
                         }
                     }
+                }
+                if !success {
+                    pb.finish_with_message(format!("请求失败: {}", file));
+                    failed_files.lock().unwrap().push(file.clone());
                 }
             });
         });
