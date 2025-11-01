@@ -82,15 +82,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 4: 获取差分文件列表
     let diff_files = fetch_diff_files(&local_commit_hash, &remote_commit_hash)?;
-    for diff_file in &diff_files {
-        println!("{YELLOW}   {diff_file}{RESET}");
+    for (diff_action, diff_file) in &diff_files {
+        match *diff_action {
+            DiffAction::Added => println!("{GREEN}  + {diff_file}{RESET}"),
+            DiffAction::Modified => println!("{YELLOW}  ~ {diff_file}{RESET}"),
+            DiffAction::Removed => println!("{RED}  - {diff_file}{RESET}"),
+        }
     }
     println!("{CYAN}正在下载新文件...{RESET}");
 
     // 下载差分文件并更新本地文件
     let results: Vec<_> = diff_files
         .par_iter()
-        .map(|file| download_and_replace_file(file).map_err(|e| format!("{}: {}", file, e)))
+        .map(|file| download_and_replace_file(file).map_err(|e| format!("{}: {}", file.1, e)))
         .collect();
 
     let errors: Vec<_> = results.into_iter().filter_map(|res| res.err()).collect();
@@ -182,18 +186,25 @@ fn fetch_remote_commit_hash() -> Result<String, Box<dyn std::error::Error>> {
     Ok(remote_commit_hash.to_string())
 }
 use scraper::{Html, Selector};
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffAction {
+    Added,
+    Modified,
+    Removed,
+}
 
 fn fetch_diff_files(
     local_commit: &str,
     remote_commit: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<(DiffAction, String)>, Box<dyn std::error::Error>> {
     // 构造差异文件的 URL
     let diff_url = format!(
         "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/compare/file-list?range={}...{}",
         local_commit, remote_commit
     );
 
-    // println!("{CYAN}Diff URL: {diff_url}{RESET}");
+    #[cfg(debug_assertions)]
+    println!("{CYAN}Diff URL: {diff_url}{RESET}");
 
     let client = reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -206,30 +217,66 @@ fn fetch_diff_files(
 
     // 使用 scraper 解析 HTML
     let document = Html::parse_document(&response);
-
+    // println!("{document:?}");
     // 匹配文件名的 <a> 标签
-    let file_selector = Selector::parse("ol.content li a").unwrap();
+    // 精确匹配列表项
+    let file_selector = Selector::parse("ol.content li").unwrap();
+    let svg_selector = Selector::parse("svg").unwrap();
+    let a_selector = Selector::parse("a").unwrap();
 
-    // 提取文件名并清理多余的空白字符
-    let files: Vec<String> = document
-        .select(&file_selector)
-        .filter_map(|element| {
-            element
-                .text()
-                .next() // 获取 <a> 标签的文本内容
-                .map(|text| text.trim().to_string()) // 去除前后空白字符
-        })
-        .filter(|file| !file.is_empty() && file != "current_version_commit_hash.txt") // 过滤掉空字符串
-        .collect();
+    let mut files = Vec::new();
+    for li in document.select(&file_selector) {
+        // 1) 优先读取 svg 的 title 属性
+        let mut action = DiffAction::Modified;
+        if let Some(svg_el) = li.select(&svg_selector).next() {
+            if let Some(title) = svg_el.value().attr("title") {
+                match title.to_lowercase().as_str() {
+                    "removed" => action = DiffAction::Removed,
+                    "added" => action = DiffAction::Added,
+                    "modified" | "changed" => action = DiffAction::Modified,
+                    other if other.contains("removed") => action = DiffAction::Removed,
+                    other if other.contains("added") => action = DiffAction::Added,
+                    _ => {}
+                }
+            } else if let Some(class) = svg_el.value().attr("class") {
+                // 备用策略：根据 class 名判断
+                if class.contains("octicon-diff-removed") || class.contains("diff-removed") {
+                    action = DiffAction::Removed;
+                } else if class.contains("octicon-diff-added") || class.contains("diff-added") {
+                    action = DiffAction::Added;
+                } else {
+                    action = DiffAction::Modified;
+                }
+            }
+        }
 
+        // 2) 提取 a 标签内完整文本作为文件路径（有时包含 span 等）
+        let a_tags: Vec<_> = li.select(&a_selector).collect();
+        if let Some(a_el) = a_tags.last() {
+            let text = a_el.text().collect::<Vec<_>>().join("").trim().to_string();
+            if !text.is_empty() && text != "current_version_commit_hash.txt" {
+                files.push((action, text));
+            }
+        }
+    }
     if files.is_empty() {
         return Err("No files found in the diff response.".into());
     }
-
     Ok(files)
 }
 
-fn download_and_replace_file(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn download_and_replace_file(
+    file: &(DiffAction, String),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (diff_action, file) = file;
+    if *diff_action == DiffAction::Removed {
+        let path = Path::new(file);
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+
     let url = format!("{}{}", BASE_DOWNLOAD_URL, file);
     let client = reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
