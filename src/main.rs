@@ -4,14 +4,22 @@ use serde_json::Value;
 use std::fs;
 use std::io::{self, Read};
 const LOCAL_COMMIT_FILE: &str = "./current_version_commit_hash.txt";
-const REPO_MASTER_COMMIT_HASH_API: &str = "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/commits/deferred_commit_data/master?original_branch=master";
-const BASE_DOWNLOAD_URL: &str = "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/raw/master/";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const CYAN: &str = "\x1b[36m";
 const RESET: &str = "\x1b[0m";
 const WORK_DIR: &str = "Kingdom Rush";
+
+const PROXY_LIST: [&str; 3] = [
+    "https://bgithub.xyz",
+    "https://dgithub.xyz",
+    "https://hub.gitmirror.com/https://github.com",
+];
+const MAX_RETRY: u64 = 3;
+const SPEED_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const MIN_SPEED: u64 = 10 * 1024; // 10KB/s
+
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -150,40 +158,44 @@ fn read_local_commit_hash() -> io::Result<String> {
 }
 
 fn fetch_remote_commit_hash() -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let response = client
-        .get(REPO_MASTER_COMMIT_HASH_API)
+    for retry in 0..MAX_RETRY {
+        let proxy = PROXY_LIST[(retry as usize) % PROXY_LIST.len()];
+        let url = format!(
+            "{}/CrazySpottedDove/KingdomRushDove/commits/deferred_commit_data/master?original_branch=master",
+            proxy
+        );
+        let client = reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?;
+        let response = client
+        .get(url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0")
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .header("X-Requested-With", "XMLHttpRequest")
         .send()?;
 
-    if !response.status().is_success() {
-        return Err(format!(
-            "Failed to fetch remote commit hash. HTTP Status: {}",
-            response.status()
-        )
-        .into());
+        if !response.status().is_success() {
+            println!("{RED}尝试使用镜像{}获取远程版本失败，状态码: {}，正在重试...{RESET}", proxy, response.status());
+            continue;
+        }
+        let response_text = response.text()?;
+        // 打印响应内容以调试
+        // println!("Remote commit API response: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text)?;
+        let deferred_commits = json["deferredCommits"]
+            .as_array()
+            .ok_or("Failed to parse 'deferredCommits' array")?;
+
+        // 获取第一个 commit 的 oid
+        let remote_commit_hash = deferred_commits
+            .get(0)
+            .and_then(|commit| commit["oid"].as_str())
+            .ok_or("Failed to parse remote commit hash")?;
+        return Ok(remote_commit_hash.to_string());
     }
-    let response_text = response.text()?;
-    // 打印响应内容以调试
-    // println!("Remote commit API response: {}", response_text);
-
-    let json: Value = serde_json::from_str(&response_text)?;
-    let deferred_commits = json["deferredCommits"]
-        .as_array()
-        .ok_or("Failed to parse 'deferredCommits' array")?;
-
-    // 获取第一个 commit 的 oid
-    let remote_commit_hash = deferred_commits
-        .get(0)
-        .and_then(|commit| commit["oid"].as_str())
-        .ok_or("Failed to parse remote commit hash")?;
-
-    Ok(remote_commit_hash.to_string())
+    Err("Failed to fetch remote commit hash after retries".into())
 }
 use scraper::{Html, Selector};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,51 +289,59 @@ fn download_and_replace_file(
         return Ok(());
     }
 
-    let url = format!("{}{}", BASE_DOWNLOAD_URL, file);
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let response = client.get(&url).send()?;
-
-    if !response.status().is_success() {
-        eprintln!(
-            "{RED}下载失败: {} 状态码: {}{RESET}",
-            file,
-            response.status()
+    let mut last_err = None;
+    for retry in 0..MAX_RETRY {
+        let proxy = PROXY_LIST[(retry as usize) % PROXY_LIST.len()];
+        let url = format!(
+            "{}/CrazySpottedDove/KingdomRushDove/raw/master/{}",
+            proxy, file
         );
-        return Err(format!(
-            "Failed to download file: {}. HTTP Status: {}",
-            file,
-            response.status()
-        )
-        .into());
+        let client = reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build();
+        let client = match client {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(format!("构建HTTP客户端失败: {:?}", e));
+                continue;
+            }
+        };
+        let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0").send();
+        match resp {
+            Ok(response) if response.status().is_success() => {
+                let content = response.bytes()?;
+                let path = Path::new(file);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, &content)?;
+                // println!("{GREEN}已更新: {}{RESET}", file);
+                return Ok(());
+            }
+            Ok(response) => {
+                eprintln!("{RED}下载失败: {url} 状态码: {}{RESET}", response.status());
+                last_err = Some(format!(
+                    "Failed to download file: {}. HTTP Status: {}",
+                    file,
+                    response.status()
+                ));
+            }
+            Err(e) => {
+                eprintln!("{RED}请求失败: {url} 错误: {:?}{RESET}", e);
+                last_err = Some(format!("请求失败: {} 错误: {:?}", url, e));
+            }
+        }
     }
 
-    let content = response.bytes()?;
-    let path = Path::new(file);
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    fs::write(path, &content)?;
-    // println!("{GREEN}已更新: {}{RESET}", file);
-
-    Ok(())
+    Err(last_err
+        .unwrap_or_else(|| "未知下载错误".to_string())
+        .into())
 }
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
-const PROXY_LIST: [&str; 3] = [
-    "https://hub.gitmirror.com/https://github.com",
-    "https://dgithub.xyz",
-    "https://bgithub.xyz",
-];
-const MAX_RETRY: u64 = 3;
-const SPEED_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const MIN_SPEED: u64 = 10 * 1024; // 10KB/s
 
 fn update_assets() -> Result<(), Box<dyn std::error::Error>> {
     let assets_index = read_assets_index("_assets/assets_index.lua")?;
