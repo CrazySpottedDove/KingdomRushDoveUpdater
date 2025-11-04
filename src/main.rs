@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::{self, Read};
 const LOCAL_COMMIT_FILE: &str = "./current_version_commit_hash.txt";
+const ORIGINAL_COMMIT_FILE: &str = "./origin_version_commit_hash.txt";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
@@ -22,6 +23,53 @@ const MIN_SPEED: u64 = 10 * 1024; // 10KB/s
 
 use std::path::Path;
 
+fn diff_commit_gitee(
+    local_commit_hash: &str,
+    remote_commit_hash: &str,
+) -> Result<(Vec<String>, Vec<(DiffAction, String)>), Box<dyn std::error::Error>> {
+    let url = format!(
+        "https://gitee.com/api/v5/repos/CrazySpottedDove/KingdomRushDove/compare/{local_commit_hash}...{remote_commit_hash}"
+    );
+    let client = reqwest::blocking::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let response_result = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0").send();
+    let Ok(response) = response_result else {
+        return Err(format!("请求 Gitee 比较接口失败: {:?}", response_result.err()).into());
+    };
+    let j_result = response.json::<serde_json::Value>();
+    let Ok(j) = j_result else {
+        return Err(format!("解析 Gitee 比较接口为 json 失败: {:?}", j_result.err()).into());
+    };
+    let commits = j["commits"].as_array().unwrap();
+    let mut messages = commits
+        .iter()
+        .map(|c| c["commit"]["message"].as_str().unwrap_or("").to_string())
+        .collect::<Vec<String>>();
+    messages.reverse();
+    let files = j["files"].as_array().unwrap();
+    let diff_records = files
+        .iter()
+        .map(|f| {
+            let filename = f["filename"].as_str().unwrap_or("").to_string();
+            let diff_action = match f["status"].as_str().unwrap_or("") {
+                "added" => DiffAction::Added,
+                "modified" => DiffAction::Modified,
+                "removed" => DiffAction::Removed,
+                _ => DiffAction::Modified,
+            };
+            (diff_action, filename)
+        })
+        .collect::<Vec<(DiffAction, String)>>();
+    Ok((messages, diff_records))
+}
+
+#[derive(PartialEq)]
+enum WorkingMode {
+    Normal,
+    Fix,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cfg!(debug_assertions) {
         if !is_current_dir_safe() {
@@ -33,44 +81,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Step 1: 读取本地 commit-hash
-    let local_commit_hash = read_local_commit_hash()?;
-    // println!("{CYAN}本地版本: {local_commit_hash}{RESET}");
+    // 让用户选择：正常更新或修复式更新。如果正常更新，输入 n 并回车；如果修复更新，输入 r 并回车
+    println!("{CYAN}请选择更新模式：{RESET}");
+    println!("{YELLOW}输入 n 并回车进行正常更新（默认）{RESET}");
+    println!("{YELLOW}输入 f 并回车进行修复式更新（重新下载所有代码文件）{RESET}");
+    let mut mode_input = String::new();
+    std::io::stdin().read_line(&mut mode_input).ok();
+    let mode_input = mode_input.trim().to_lowercase();
+    let working_mode = if mode_input == "f" {
+        WorkingMode::Fix
+    } else {
+        WorkingMode::Normal
+    };
 
-    // 异步拉取 Gitee 日志：在后台线程执行，不阻塞下载
+    let local_commit_hash = match working_mode {
+        WorkingMode::Normal => read_local_commit_hash()?,
+        WorkingMode::Fix => read_original_commit_hash()?,
+    };
 
-    let owner = "CrazySpottedDove".to_string();
-    let repo = "KingdomRushDove".to_string();
-    let local = local_commit_hash.clone();
-    // let remote = remote_commit_hash.clone();
-
-    // 启动一个线程同时获取和打印日志
-    let handle = std::thread::spawn(move || {
-        match fetch_commit_logs_gitee(&owner, &repo, &local) {
-            Ok(logs) => {
-                if !logs.is_empty() {
-                    println!("{CYAN}本次更新内容（来自 Gitee）：{RESET}");
-                    for line in logs {
-                        println!("{YELLOW}{}{RESET}", line);
-                    }
-                }
-            }
-            Err(e) => {
-                // 拉取失败：打印错误信息（可选）
-                eprintln!("{RED}拉取更新日志失败：{}{RESET}", e);
-            }
-        }
-    });
-
-    // Step 2: 获取远程仓库的最新 commit-hash
-    println!("{CYAN}正在检查最新版本...{RESET}");
+    println!("{CYAN}正在检查最新版本(ง •_•)ง{RESET}");
     let remote_commit_hash = fetch_remote_commit_hash()?;
-    // println!("{CYAN}最新版本: {remote_commit_hash}{RESET}");
 
-    // Step 3: 比较 commit-hash
     if local_commit_hash == remote_commit_hash {
         println!("{GREEN}已是最新，无需更新。{RESET}");
-        println!("{YELLOW}如果想强行检查美术资源，请输入c并回车{RESET}");
+        println!("{YELLOW}如果想强行检查美术资源，请输入 c 并回车{RESET}");
         println!("{YELLOW}否则，按回车退出{RESET}");
 
         let mut input = String::new();
@@ -86,21 +120,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{GREEN}检测到新版本，准备更新...{RESET}");
+    println!("{GREEN}检测到新版本，进入更新例程(*^_^*){RESET}");
 
-    // Step 4: 获取差分文件列表
-    let diff_files = fetch_diff_files(&local_commit_hash, &remote_commit_hash)?;
-    for (diff_action, diff_file) in &diff_files {
+    println!("{CYAN}正在分析本地与远程文件差异，请稍候……{RESET}");
+    let (messages, diff_records) = diff_commit_gitee(&local_commit_hash, &remote_commit_hash)?;
+
+    // if working_mode == WorkingMode::Normal {
+    for (diff_action, diff_file) in &diff_records {
         match *diff_action {
             DiffAction::Added => println!("{GREEN}  + {diff_file}{RESET}"),
             DiffAction::Modified => println!("{YELLOW}  ~ {diff_file}{RESET}"),
             DiffAction::Removed => println!("{RED}  - {diff_file}{RESET}"),
         }
     }
-    println!("{CYAN}正在下载新文件...{RESET}");
+    // }
+    println!("{CYAN}正在下载新文件ε=( o｀ω′)ノ请等待哟(＾Ｕ＾)ノ~ＹＯ{RESET}");
 
     // 下载差分文件并更新本地文件
-    let results: Vec<_> = diff_files
+    let results: Vec<_> = diff_records
         .par_iter()
         .map(|file| download_and_replace_file(file).map_err(|e| format!("{}: {}", file.1, e)))
         .collect();
@@ -118,15 +155,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let _ = handle.join();
+    println!("{GREEN}代码文件更新完成(＾Ｕ＾)ノ~ＹＯ{RESET}");
+
+    if working_mode == WorkingMode::Normal {
+        println!("{CYAN}本次更新内容摘要：{RESET}");
+        for message in &messages {
+            print!("{YELLOW} - {message}{RESET}");
+        }
+        io::stdout().flush().ok();
+    }
 
     update_assets()?;
 
-    println!("{GREEN}全部更新完成！{RESET}");
+    println!("{GREEN}所有资源全部更新完成o(*￣▽￣*)ブ{RESET}");
 
     // 写回最新 commit_hash
     fs::write(LOCAL_COMMIT_FILE, &remote_commit_hash)?;
-    println!("{GREEN}已更新本地版本记录。{RESET}");
+    println!("{GREEN}已更新本地版本记录(●'◡'●)。{RESET}");
     wait_for_enter();
     Ok(())
 }
@@ -157,6 +202,13 @@ fn read_local_commit_hash() -> io::Result<String> {
     Ok(hash.trim().to_string())
 }
 
+fn read_original_commit_hash() -> io::Result<String> {
+    let mut file = fs::File::open(ORIGINAL_COMMIT_FILE)?;
+    let mut hash = String::new();
+    file.read_to_string(&mut hash)?;
+    Ok(hash.trim().to_string())
+}
+
 fn fetch_remote_commit_hash() -> Result<String, Box<dyn std::error::Error>> {
     for retry in 0..MAX_RETRY {
         let proxy = PROXY_LIST[(retry as usize) % PROXY_LIST.len()];
@@ -176,7 +228,11 @@ fn fetch_remote_commit_hash() -> Result<String, Box<dyn std::error::Error>> {
         .send()?;
 
         if !response.status().is_success() {
-            println!("{RED}尝试使用镜像{}获取远程版本失败，状态码: {}，正在重试...{RESET}", proxy, response.status());
+            println!(
+                "{RED}尝试使用镜像{}获取远程版本失败，状态码: {}，正在重试...{RESET}",
+                proxy,
+                response.status()
+            );
             continue;
         }
         let response_text = response.text()?;
@@ -197,84 +253,12 @@ fn fetch_remote_commit_hash() -> Result<String, Box<dyn std::error::Error>> {
     }
     Err("Failed to fetch remote commit hash after retries".into())
 }
-use scraper::{Html, Selector};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffAction {
     Added,
     Modified,
     Removed,
-}
-
-fn fetch_diff_files(
-    local_commit: &str,
-    remote_commit: &str,
-) -> Result<Vec<(DiffAction, String)>, Box<dyn std::error::Error>> {
-    // 构造差异文件的 URL
-    let diff_url = format!(
-        "https://dgithub.xyz/CrazySpottedDove/KingdomRushDove/compare/file-list?range={}...{}",
-        local_commit, remote_commit
-    );
-
-    #[cfg(debug_assertions)]
-    println!("{CYAN}Diff URL: {diff_url}{RESET}");
-
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let response = client
-        .get(&diff_url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0")
-        .send()?
-        .text()?;
-
-    // 使用 scraper 解析 HTML
-    let document = Html::parse_document(&response);
-    // println!("{document:?}");
-    // 匹配文件名的 <a> 标签
-    // 精确匹配列表项
-    let file_selector = Selector::parse("ol.content li").unwrap();
-    let svg_selector = Selector::parse("svg").unwrap();
-    let a_selector = Selector::parse("a").unwrap();
-
-    let mut files = Vec::new();
-    for li in document.select(&file_selector) {
-        // 1) 优先读取 svg 的 title 属性
-        let mut action = DiffAction::Modified;
-        if let Some(svg_el) = li.select(&svg_selector).next() {
-            if let Some(title) = svg_el.value().attr("title") {
-                match title.to_lowercase().as_str() {
-                    "removed" => action = DiffAction::Removed,
-                    "added" => action = DiffAction::Added,
-                    "modified" | "changed" => action = DiffAction::Modified,
-                    other if other.contains("removed") => action = DiffAction::Removed,
-                    other if other.contains("added") => action = DiffAction::Added,
-                    _ => {}
-                }
-            } else if let Some(class) = svg_el.value().attr("class") {
-                // 备用策略：根据 class 名判断
-                if class.contains("octicon-diff-removed") || class.contains("diff-removed") {
-                    action = DiffAction::Removed;
-                } else if class.contains("octicon-diff-added") || class.contains("diff-added") {
-                    action = DiffAction::Added;
-                } else {
-                    action = DiffAction::Modified;
-                }
-            }
-        }
-
-        // 2) 提取 a 标签内完整文本作为文件路径（有时包含 span 等）
-        let a_tags: Vec<_> = li.select(&a_selector).collect();
-        if let Some(a_el) = a_tags.last() {
-            let text = a_el.text().collect::<Vec<_>>().join("").trim().to_string();
-            if !text.is_empty() && text != "current_version_commit_hash.txt" {
-                files.push((action, text));
-            }
-        }
-    }
-    if files.is_empty() {
-        return Err("No files found in the diff response.".into());
-    }
-    Ok(files)
 }
 
 fn download_and_replace_file(
@@ -319,7 +303,10 @@ fn download_and_replace_file(
                 return Ok(());
             }
             Ok(response) => {
-                eprintln!("{RED}下载失败: {url} 状态码: {}{RESET}", response.status());
+                eprintln!(
+                    "{YELLOW}下载失败: {url} 状态码: {}{RESET}，已为您重试",
+                    response.status()
+                );
                 last_err = Some(format!(
                     "Failed to download file: {}. HTTP Status: {}",
                     file,
@@ -327,7 +314,7 @@ fn download_and_replace_file(
                 ));
             }
             Err(e) => {
-                eprintln!("{RED}请求失败: {url} 错误: {:?}{RESET}", e);
+                eprintln!("{YELLOW}请求失败: {url} 错误: {e:?}{RESET}，已为您重试");
                 last_err = Some(format!("请求失败: {} 错误: {:?}", url, e));
             }
         }
@@ -601,121 +588,4 @@ fn trash_unindexed_assets(
         }
     }
     Ok(())
-}
-
-/// 从 Gitee 分页获取 commits，直到遇到 local_commit 为止，返回从 local 之后到 remote 的 commit message 列表（旧->新）
-fn fetch_commit_logs_gitee(
-    owner: &str,
-    repo: &str,
-    local_commit: &str,
-    // remote_commit: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()?;
-    let mut page = 1;
-    let per_page = 100usize;
-    let mut collected: Vec<(String, String)> = Vec::new(); // (oid, message)
-
-    loop {
-        let url = format!(
-            "https://gitee.com/api/v5/repos/{owner}/{repo}/commits?page={page}&per_page={per_page}",
-            owner = owner,
-            repo = repo,
-            page = page,
-            per_page = per_page
-        );
-
-        let resp = client
-            .get(&url)
-            .header("User-Agent", "Mozilla/5.0")
-            .send()?;
-
-        if !resp.status().is_success() {
-            break;
-        }
-        let text = resp.text()?;
-        let arr: Value = serde_json::from_str(&text)?;
-        let commits = arr
-            .as_array()
-            .ok_or("Gitee commits response is not array")?;
-        if commits.is_empty() {
-            break;
-        }
-
-        for c in commits {
-            // Gitee 的 commit 对象通常有 "id" 与 "message"
-            let oid = c
-                .get("id")
-                .and_then(|v| v.as_str())
-                .or_else(|| c.get("sha").and_then(|v| v.as_str()))
-                .unwrap_or("")
-                .to_string();
-            let msg = c
-                .get("commit")
-                .and_then(|commit| commit.get("message"))
-                .or_else(|| c.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            collected.push((oid.clone(), msg));
-
-            // 一旦遇到 local_commit，停止拉取（因为返回按时间倒序）
-            if oid == local_commit {
-                break;
-            }
-        }
-
-        // 如果最后一页包含 local_commit，则停止分页
-        if collected.iter().any(|(oid, _)| oid == local_commit) {
-            break;
-        }
-        page += 1;
-        // 安全保护：防止无限循环
-        if page > 50 {
-            break;
-        }
-    }
-
-    if collected.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // collected 目前是从新到旧（Gitee 默认），我们需要从 local 之后到 remote 的顺序（旧->新）
-    // 找到 local_commit 在列表中的位置（可能不存在）
-    let mut result: Vec<String> = Vec::new();
-    // 收集直到但不包含 local_commit；同时只保留到 remote_commit 为止（remote 应位于最前面）
-    for (oid, _) in &collected {
-        if oid == local_commit {
-            break;
-        }
-    }
-    // collected 是 newest -> older，截取从 remote（包含）到 local（不包含）
-    // 我们找到索引
-    let idx_local = collected.iter().position(|(oid, _)| oid == local_commit);
-    // let idx_remote = collected.iter().position(|(oid, _)| oid == remote_commit);
-
-    // let start = idx_remote.unwrap_or(0); // remote 在较前位置（可能 0）
-    let start = 0;
-    let end = idx_local.unwrap_or(collected.len()); // 不包含 local
-
-    // slice start..end (newest->older), 需要 reverse 成旧->新并格式化
-    if start < end {
-        let slice = &collected[start..end];
-        let mut rev: Vec<(String, String)> = slice.iter().cloned().collect();
-        rev.reverse();
-        for (oid, msg) in rev {
-            let short = if oid.len() >= 8 { &oid[..8] } else { &oid[..] };
-            if msg.is_empty() {
-                result.push(format!("- ({})", short));
-            } else {
-                // 只取第一行作为摘要
-                let first_line = msg.lines().next().unwrap_or("").trim();
-                result.push(format!("- {} ({})", first_line, short));
-            }
-        }
-    }
-
-    Ok(result)
 }
